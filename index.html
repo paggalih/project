@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MSC manufacturing DES simulator</title>
+<style>
+  :root{
+    --bg:#0f1210; --panel:#161b18; --border:#2a322d;
+    --text:#e8ece9; --muted:#8b978f;
+    --accent:#5dcaa5; --accent-dark:#1d9e75;
+    --warn:#ef9f27;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:'Courier New', monospace; padding:24px;
+  }
+  h1{font-size:20px; font-weight:600; margin:0 0 4px;}
+  p.sub{color:var(--muted); font-size:13px; margin:0 0 24px;}
+  .grid{display:grid; grid-template-columns:280px 1fr; gap:20px;}
+  @media (max-width:800px){ .grid{grid-template-columns:1fr;} }
+  .panel{
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:8px; padding:16px;
+  }
+  label{display:block; font-size:12px; color:var(--muted); margin:12px 0 4px;}
+  input[type=number]{
+    width:100%; background:#0c0f0d; border:1px solid var(--border);
+    color:var(--text); padding:6px 8px; border-radius:4px; font-family:inherit;
+  }
+  button{
+    margin-top:18px; width:100%; padding:10px; border:none;
+    border-radius:4px; background:var(--accent-dark); color:#eafff6;
+    font-family:inherit; font-weight:600; cursor:pointer; font-size:13px;
+  }
+  button:hover{background:var(--accent);}
+  table{width:100%; border-collapse:collapse; font-size:12px; margin-top:10px;}
+  th,td{padding:6px 8px; border-bottom:1px solid var(--border); text-align:left;}
+  th{color:var(--muted); font-weight:600;}
+  .stage-bar{height:10px; background:#0c0f0d; border-radius:5px; overflow:hidden; margin-top:4px;}
+  .stage-fill{height:100%; background:var(--accent-dark);}
+  .stat{display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); font-size:13px;}
+  .stat span:last-child{color:var(--accent);}
+  #log{
+    height:180px; overflow-y:auto; background:#0c0f0d; border:1px solid var(--border);
+    border-radius:4px; padding:8px; font-size:11px; color:var(--muted); margin-top:12px;
+  }
+</style>
+</head>
+<body>
+
+<h1>MSC manufacturing DES simulator</h1>
+<p class="sub">Discrete-event + queueing model. Batches flow: thaw → expansion → passaging → harvest → QC → fill-finish.</p>
+
+<div class="grid">
+  <div class="panel">
+    <label>Number of batches</label>
+    <input type="number" id="numBatches" value="20" min="1">
+
+    <label>Batch arrival interval (h)</label>
+    <input type="number" id="arrivalInterval" value="4" min="0.1" step="0.1">
+
+    <label>Thaw servers / mean time (h)</label>
+    <input type="number" id="thawServers" value="2" min="1">
+    <input type="number" id="thawTime" value="1" min="0.1" step="0.1">
+
+    <label>Expansion bioreactors / mean time (h)</label>
+    <input type="number" id="expServers" value="3" min="1">
+    <input type="number" id="expTime" value="48" min="0.1" step="0.1">
+
+    <label>Passaging incubators / mean time (h)</label>
+    <input type="number" id="passServers" value="2" min="1">
+    <input type="number" id="passTime" value="6" min="0.1" step="0.1">
+
+    <label>Harvest rigs / mean time (h)</label>
+    <input type="number" id="harvServers" value="2" min="1">
+    <input type="number" id="harvTime" value="3" min="0.1" step="0.1">
+
+    <label>QC staff / mean time (h)</label>
+    <input type="number" id="qcServers" value="2" min="1">
+    <input type="number" id="qcTime" value="8" min="0.1" step="0.1">
+
+    <label>Fill-finish lines / mean time (h)</label>
+    <input type="number" id="fillServers" value="1" min="1">
+    <input type="number" id="fillTime" value="2" min="0.1" step="0.1">
+
+    <button onclick="runSimulation()">Run simulation</button>
+  </div>
+
+  <div class="panel">
+    <div id="stats"></div>
+    <table id="stageTable">
+      <thead><tr><th>Stage</th><th>Avg wait (h)</th><th>Max queue</th><th>Utilization</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+// Exponential random draw for stochastic service/arrival times
+function expRand(mean){ return -mean * Math.log(1 - Math.random()); }
+
+// Simple multi-server queue stage
+class Stage {
+  constructor(name, servers, meanTime){
+    this.name = name;
+    this.servers = servers;
+    this.meanTime = meanTime;
+    this.freeAt = new Array(servers).fill(0); // when each server becomes free
+    this.waits = [];
+    this.busyTime = 0;
+    this.maxQueue = 0;
+  }
+  // batch arrives at time t, returns time it finishes this stage
+  process(t){
+    // find earliest-free server
+    let idx = 0;
+    for(let i=1;i<this.freeAt.length;i++){
+      if(this.freeAt[i] < this.freeAt[idx]) idx = i;
+    }
+    const start = Math.max(t, this.freeAt[idx]);
+    const wait = start - t;
+    this.waits.push(wait);
+    const queueDepth = this.freeAt.filter(f => f > t).length;
+    if(queueDepth > this.maxQueue) this.maxQueue = queueDepth;
+
+    const service = expRand(this.meanTime);
+    const finish = start + service;
+    this.busyTime += service;
+    this.freeAt[idx] = finish;
+    return finish;
+  }
+  avgWait(){ return this.waits.reduce((a,b)=>a+b,0) / this.waits.length || 0; }
+  utilization(totalTime){ return this.busyTime / (this.servers * totalTime); }
+}
+
+function runSimulation(){
+  const numBatches = parseInt(document.getElementById('numBatches').value);
+  const arrivalInterval = parseFloat(document.getElementById('arrivalInterval').value);
+
+  const stages = [
+    new Stage('Thaw', parseInt(document.getElementById('thawServers').value), parseFloat(document.getElementById('thawTime').value)),
+    new Stage('Expansion', parseInt(document.getElementById('expServers').value), parseFloat(document.getElementById('expTime').value)),
+    new Stage('Passaging', parseInt(document.getElementById('passServers').value), parseFloat(document.getElementById('passTime').value)),
+    new Stage('Harvest', parseInt(document.getElementById('harvServers').value), parseFloat(document.getElementById('harvTime').value)),
+    new Stage('QC', parseInt(document.getElementById('qcServers').value), parseFloat(document.getElementById('qcTime').value)),
+    new Stage('Fill-finish', parseInt(document.getElementById('fillServers').value), parseFloat(document.getElementById('fillTime').value)),
+  ];
+
+  const log = document.getElementById('log');
+  log.innerHTML = '';
+
+  let arrival = 0;
+  let lastFinish = 0;
+  const cycleTimes = [];
+
+  for(let b=1; b<=numBatches; b++){
+    arrival += expRand(arrivalInterval);
+    let t = arrival;
+    for(const stage of stages){
+      t = stage.process(t);
+    }
+    lastFinish = Math.max(lastFinish, t);
+    cycleTimes.push(t - arrival);
+    log.innerHTML += `Batch ${b}: arrived ${arrival.toFixed(1)}h, finished ${t.toFixed(1)}h, cycle ${(t-arrival).toFixed(1)}h\n`;
+  }
+  log.scrollTop = log.scrollHeight;
+
+  const totalTime = lastFinish;
+  const avgCycle = cycleTimes.reduce((a,b)=>a+b,0) / cycleTimes.length;
+  const throughput = numBatches / totalTime;
+
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><span>Total makespan</span><span>${totalTime.toFixed(1)} h</span></div>
+    <div class="stat"><span>Avg cycle time / batch</span><span>${avgCycle.toFixed(1)} h</span></div>
+    <div class="stat"><span>Throughput</span><span>${(throughput*24).toFixed(2)} batches/day</span></div>
+  `;
+
+  const tbody = document.querySelector('#stageTable tbody');
+  tbody.innerHTML = '';
+  for(const s of stages){
+    const util = (s.utilization(totalTime)*100).toFixed(0);
+    tbody.innerHTML += `
+      <tr>
+        <td>${s.name}</td>
+        <td>${s.avgWait().toFixed(2)}</td>
+        <td>${s.maxQueue}</td>
+        <td>
+          ${util}%
+          <div class="stage-bar"><div class="stage-fill" style="width:${util}%"></div></div>
+        </td>
+      </tr>`;
+  }
+}
+
+runSimulation();
+</script>
+</body>
+</html>
