@@ -83,10 +83,12 @@
       <input type="number" id="salary" value="3500">
       <label>Lab fixed overhead per month</label>
       <input type="number" id="overhead" value="10000">
-      <label>Patient treatment cost per dose</label>
+      <label>Production cost per dose (media, reagents etc)</label>
       <input type="number" id="patientCost" value="200">
       <label>Cells per patient dose</label>
       <input type="number" id="cellsPerDose" value="1000000">
+      <label>Revenue charged per patient dose</label>
+      <input type="number" id="revenuePerDose" value="1500">
     </fieldset>
 
     <fieldset>
@@ -100,6 +102,7 @@
 
   <div class="panel">
     <div id="stats"></div>
+    <div id="bepStats"></div>
     <table id="resultTable">
       <thead><tr><th>Resource</th><th>Count needed</th><th>Monthly cost</th></tr></thead>
       <tbody></tbody>
@@ -130,6 +133,7 @@ function optimize(){
   const overhead = parseFloat(document.getElementById('overhead').value);
   const patientCost = parseFloat(document.getElementById('patientCost').value);
   const cellsPerDose = parseFloat(document.getElementById('cellsPerDose').value);
+  const revenuePerDose = parseFloat(document.getElementById('revenuePerDose').value);
 
   const maxSearch = parseInt(document.getElementById('maxSearch').value);
 
@@ -167,8 +171,14 @@ function optimize(){
 
           const totalCost = bioCost + incCost + cabCost + flaskCost + laborCost + overhead + patientTotal;
 
+          // full upfront equipment cost, not depreciated - for BEP
+          const capex = (bio * bioPrice) + (inc * incPrice) + (cab * cabPrice);
+          const monthlyOperating = flaskCost + laborCost + overhead + patientTotal;
+          const monthlyRevenue = doses * revenuePerDose;
+          const monthlyProfit = monthlyRevenue - monthlyOperating;
+
           if(best === null || totalCost < best.totalCost){
-            best = { bio, inc, cab, lab, flasksNeeded, bioCost, incCost, cabCost, flaskCost, laborCost, overhead, patientTotal, totalCost, batchesNeeded };
+            best = { bio, inc, cab, lab, flasksNeeded, bioCost, incCost, cabCost, flaskCost, laborCost, overhead, patientTotal, totalCost, batchesNeeded, capex, monthlyOperating, monthlyRevenue, monthlyProfit };
           }
         }
       }
@@ -192,6 +202,20 @@ function optimize(){
     <div class="stat"><span>Total monthly cost</span><span>$${best.totalCost.toFixed(0)}</span></div>
     <div class="stat"><span>Cost per batch</span><span>$${(best.totalCost/best.batchesNeeded).toFixed(0)}</span></div>
   `;
+
+  const bepEl = document.getElementById('bepStats');
+  if(best.monthlyProfit <= 0){
+    bepEl.innerHTML = `<div class="stat"><span>Break-even</span><span>Not reached — monthly cost exceeds revenue</span></div>`;
+  } else {
+    const bepMonths = best.capex / best.monthlyProfit;
+    bepEl.innerHTML = `
+      <div class="stat"><span>Upfront equipment cost (capex)</span><span>$${best.capex.toFixed(0)}</span></div>
+      <div class="stat"><span>Monthly operating cost</span><span>$${best.monthlyOperating.toFixed(0)}</span></div>
+      <div class="stat"><span>Monthly revenue</span><span>$${best.monthlyRevenue.toFixed(0)}</span></div>
+      <div class="stat"><span>Monthly profit</span><span>$${best.monthlyProfit.toFixed(0)}</span></div>
+      <div class="stat"><span>Break-even point</span><span>${bepMonths.toFixed(1)} months</span></div>
+    `;
+  }
 
   tbody.innerHTML = `
     <tr><td>Bioreactors</td><td>${best.bio}</td><td>$${best.bioCost.toFixed(0)}</td></tr>
