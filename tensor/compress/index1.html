@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tucker PDF Compressor</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1b1b1b; --muted:#666; --card:#fff; --line:#ddd; --acc:#2b5fd9; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141414; --fg:#eee; --muted:#9a9a9a; --card:#1e1e1e; --line:#333; --acc:#7aa2ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { margin:0 0 4px; font-size:1.6rem; }
+  .sub { margin:0 0 20px; color:var(--muted); }
+  .panel { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px 16px;
+           background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:.85rem; color:var(--muted); }
+  label.row { flex-direction:row; align-items:center; gap:8px; }
+  input, select, button { font:inherit; color:var(--fg); background:var(--bg);
+           border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  input[type=range], input[type=checkbox] { padding:0; }
+  button { background:var(--acc); color:#fff; border:0; cursor:pointer; align-self:end; padding:9px; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { min-height:1.5em; color:var(--muted); margin:14px 0 6px; }
+  progress { width:100%; height:8px; margin-bottom:14px; }
+  #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .card canvas { display:block; width:100%; height:auto; background:#fff; border-bottom:1px solid var(--line); }
+  .meta { padding:10px 12px; font-size:.85rem; }
+  .meta b { display:block; font-size:.95rem; margin-bottom:2px; }
+  .meta a { display:inline-block; margin-top:6px; color:var(--acc); font-weight:600; text-decoration:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tucker PDF Compressor</h1>
+  <p class="sub">Rasterizes each page, compresses it with Tucker (HOSVD + HOOI), rebuilds the PDF. Runs fully in your browser.
+    Output pages are images: text is no longer selectable or searchable.</p>
+
+  <section class="panel">
+    <label>PDF <input type="file" id="file" accept="application/pdf"></label>
+    <label>Render resolution
+      <select id="dpi"><option value="72">72 DPI (small)</option><option value="100" selected>100 DPI</option><option value="150">150 DPI (sharp, slow)</option></select>
+    </label>
+    <label>Spatial ranks (comma-separated) <input id="ranks" value="50, 100, 200"></label>
+    <label>Colour rank
+      <select id="crank"><option value="3" selected>3 (full colour)</option><option value="2">2</option><option value="1">1 (near grayscale)</option></select>
+    </label>
+    <label>HOOI iterations <input id="iters" type="number" min="0" max="20" value="3"></label>
+    <label>JPEG quality: <span id="qv">0.75</span>
+      <input id="quality" type="range" min="0.3" max="1" step="0.05" value="0.75">
+    </label>
+    <label class="row"><input type="checkbox" id="baseline" checked> Include JPEG-only baseline</label>
+    <button id="run" disabled>Loading Python…</button>
+  </section>
+
+  <p id="status"></p>
+  <progress id="prog" value="0" max="1" hidden></progress>
+  <div id="grid"></div>
+</main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const PY = `
+import numpy as np
+
+def unfold(T, m):
+    return np.moveaxis(T, m, 0).reshape(T.shape[m], -1)
+
+def mode_dot(T, M, m):
+    Tm = np.moveaxis(T, m, 0)
+    sh = Tm.shape
+    out = (M @ Tm.reshape(sh[0], -1)).reshape(M.shape[0], *sh[1:])
+    return np.moveaxis(out, 0, m)
+
+def lead(A, r):
+    if A.shape[0] <= A.shape[1]:
+        _, V = np.linalg.eigh(A @ A.T)
+        return np.ascontiguousarray(V[:, ::-1][:, :r])
+    return np.linalg.svd(A, full_matrices=False)[0][:, :r]
+
+def tucker(X, ranks, n_iter):
+    ranks = [min(r, s) for r, s in zip(ranks, X.shape)]
+    U = [lead(unfold(X, n), r) for n, r in enumerate(ranks)]
+    for _ in range(n_iter):
+        for n in range(X.ndim):
+            Y = X
+            for m in range(X.ndim):
+                if m != n:
+                    Y = mode_dot(Y, U[m].T, m)
+            U[n] = lead(unfold(Y, n), ranks[n])
+    G = X
+    for n in range(X.ndim):
+        G = mode_dot(G, U[n].T, n)
+    return G, U
+
+def reconstruct(G, U):
+    Xr = G
+    for n, u in enumerate(U):
+        Xr = mode_dot(Xr, u, n)
+    return np.clip(Xr, 0, 1)
+
+def run(buf, h, w, r1, r2, r3, iters, out):
+    a = np.frombuffer(buf.to_py(), dtype=np.uint8).reshape(h, w, 4)
+    X = a[:, :, :3].astype(np.float32) / 255.0
+    G, U = tucker(X, [r1, r2, r3], iters)
+    Xr = reconstruct(G, U)
+    mse = float(np.mean((X - Xr) ** 2))
+    p = 10 * np.log10(1.0 / mse) if mse > 0 else 99.0
+    n_params = G.size + sum(u.size for u in U)
+    rgba = np.empty((h, w, 4), dtype=np.uint8)
+    rgba[:, :, :3] = np.round(Xr * 255)
+    rgba[:, :, 3] = 255
+    out.assign(rgba.reshape(-1))
+    return (float(p), float(X.size / n_params))
+`;
+
+const $ = id => document.getElementById(id);
+const setStatus = t => { $('status').textContent = t; };
+const tick = () => new Promise(r => setTimeout(r, 20));
+const toBlob = (c, type, q) => new Promise(r => c.toBlob(r, type, q));
+const kb = n => n > 1048576 ? (n / 1048576).toFixed(2) + ' MB' : (n / 1024).toFixed(1) + ' KB';
+let runFn = null, file = null, urls = [];
+
+function updateButton() {
+  $('run').disabled = !(runFn && file);
+  if (runFn) $('run').textContent = 'Compress PDF';
+}
+
+(async () => {
+  try {
+    setStatus('Loading Pyodide + NumPy (first visit ~10 MB)…');
+    const py = await loadPyodide();
+    await py.loadPackage('numpy');
+    await py.runPythonAsync(PY);
+    runFn = py.globals.get('run');
+    setStatus('Ready. Choose a PDF.');
+    updateButton();
+  } catch (e) { setStatus('Failed to load Python: ' + e); }
+})();
+
+$('file').onchange = e => { file = e.target.files[0] || null; updateButton(); };
+$('quality').oninput = e => { $('qv').textContent = (+e.target.value).toFixed(2); };
+
+async function renderPage(page, dpi) {
+  const vp1 = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: dpi / 72 });
+  const c = document.createElement('canvas');
+  c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  return { canvas: c, ptW: vp1.width, ptH: vp1.height };
+}
+
+function thumb(src) {
+  const s = Math.min(1, 400 / src.width);
+  const c = document.createElement('canvas');
+  c.width = Math.round(src.width * s); c.height = Math.round(src.height * s);
+  c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  return c;
+}
+
+async function buildPdf(pages) {
+  const doc = await PDFLib.PDFDocument.create();
+  for (const p of pages) {
+    const img = await doc.embedJpg(p.bytes);
+    const pg = doc.addPage([p.w, p.h]);
+    pg.drawImage(img, { x: 0, y: 0, width: p.w, height: p.h });
+  }
+  return new Blob([await doc.save()], { type: 'application/pdf' });
+}
+
+function addCard(title, lines, canvas, blob, tag) {
+  const url = URL.createObjectURL(blob);
+  urls.push(url);
+  const el = document.createElement('div');
+  el.className = 'card';
+  const pct = (100 * blob.size / file.size).toFixed(0);
+  el.innerHTML = `<div class="meta"><b>${title}</b>${lines.join('<br>')}
+    <br>PDF size: ${kb(blob.size)} (${pct}% of original)<br>
+    <a href="${url}" download="${file.name.replace(/\.pdf$/i, '')}_${tag}.pdf">Download PDF</a></div>`;
+  el.prepend(canvas);
+  $('grid').append(el);
+}
+
+$('run').onclick = async () => {
+  const ranks = $('ranks').value.split(/[\s,;]+/).map(Number).filter(n => n > 0);
+  const useBase = $('baseline').checked;
+  if (!ranks.length && !useBase) { setStatus('Enter at least one rank.'); return; }
+  $('run').disabled = true;
+  urls.forEach(URL.revokeObjectURL); urls = [];
+  $('grid').innerHTML = '';
+  const dpi = +$('dpi').value, q = +$('quality').value;
+  const crank = +$('crank').value, iters = +$('iters').value;
+  const t0 = performance.now();
+
+  try {
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    const n = pdf.numPages;
+    const keys = (useBase ? ['base'] : []).concat(ranks.map(r => 'r' + r));
+    const res = Object.fromEntries(keys.map(k => [k, { pages: [], psnr: 0, ratio: 0, thumb: null }]));
+    const prog = $('prog');
+    prog.hidden = false; prog.max = n * keys.length; prog.value = 0;
+
+    for (let i = 1; i <= n; i++) {
+      setStatus(`Rendering page ${i}/${n}…`);
+      await tick();
+      const page = await pdf.getPage(i);
+      const { canvas, ptW, ptH } = await renderPage(page, dpi);
+      const w = canvas.width, h = canvas.height;
+
+      if (useBase) {
+        const blob = await toBlob(canvas, 'image/jpeg', q);
+        res.base.pages.push({ bytes: new Uint8Array(await blob.arrayBuffer()), w: ptW, h: ptH });
+        if (i === 1) res.base.thumb = thumb(canvas);
+        prog.value++;
+      }
+
+      const input = new Uint8Array(canvas.getContext('2d').getImageData(0, 0, w, h).data.buffer);
+      for (const r of ranks) {
+        setStatus(`Page ${i}/${n} — rank ${r}…`);
+        await tick();
+        const out = new Uint8Array(w * h * 4);
+        const pr = runFn(input, h, w, r, r, crank, iters, out);
+        const [psnr, ratio] = pr.toJs();
+        pr.destroy();
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(out.buffer), w, h), 0, 0);
+        const blob = await toBlob(c, 'image/jpeg', q);
+        const k = res['r' + r];
+        k.pages.push({ bytes: new Uint8Array(await blob.arrayBuffer()), w: ptW, h: ptH });
+        k.psnr += psnr / n; k.ratio += ratio / n;
+        if (i === 1) k.thumb = thumb(c);
+        prog.value++;
+      }
+      page.cleanup();
+    }
+
+    setStatus('Building PDFs…');
+    await tick();
+    if (useBase) {
+      addCard('JPEG only (no Tucker)', [`${n} pages, ${dpi} DPI, q=${q}`],
+        res.base.thumb, await buildPdf(res.base.pages), `jpeg_${dpi}dpi`);
+    }
+    for (const r of ranks) {
+      const k = res['r' + r];
+      addCard(`Rank ${r} × ${r} × ${crank}`,
+        [`${n} pages, ${dpi} DPI, q=${q}`, `Avg param ratio: ${k.ratio.toFixed(1)}×`,
+         `Avg PSNR: ${k.psnr.toFixed(2)} dB`],
+        k.thumb, await buildPdf(k.pages), `tucker_r${r}_${dpi}dpi`);
+    }
+    prog.hidden = true;
+    setStatus(`Done in ${((performance.now() - t0) / 1000).toFixed(1)} s. Original: ${kb(file.size)}.`);
+  } catch (e) { setStatus('Error: ' + e); }
+  updateButton();
+};
+</script>
+</body>
+</html>
