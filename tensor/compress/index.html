@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tucker Image Compressor</title>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1b1b1b; --muted:#666; --card:#fff; --line:#ddd; --acc:#2b5fd9; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141414; --fg:#eee; --muted:#9a9a9a; --card:#1e1e1e; --line:#333; --acc:#7aa2ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { margin:0 0 4px; font-size:1.6rem; }
+  .sub { margin:0 0 20px; color:var(--muted); }
+  .panel { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px 16px;
+           background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:.85rem; color:var(--muted); }
+  input, select, button { font:inherit; color:var(--fg); background:var(--bg);
+           border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  input[type=range] { padding:0; }
+  button { background:var(--acc); color:#fff; border:0; cursor:pointer; align-self:end; padding:9px; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { min-height:1.5em; color:var(--muted); margin:14px 0; }
+  #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .card canvas { display:block; width:100%; height:auto; background:#000; }
+  .meta { padding:10px 12px; font-size:.85rem; }
+  .meta b { display:block; font-size:.95rem; margin-bottom:2px; }
+  .meta a { display:inline-block; margin-top:6px; color:var(--acc); font-weight:600; text-decoration:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tucker Image Compressor</h1>
+  <p class="sub">HOSVD + HOOI decomposition. Runs fully in your browser — no image leaves your device.</p>
+
+  <section class="panel">
+    <label>Image <input type="file" id="file" accept="image/*"></label>
+    <label>Max side (px)
+      <select id="maxside"><option>512</option><option selected>1024</option><option>2048</option></select>
+    </label>
+    <label>Spatial ranks (comma-separated) <input id="ranks" value="20, 50, 100, 200"></label>
+    <label>Colour rank
+      <select id="crank"><option value="3" selected>3 (full colour)</option><option value="2">2</option><option value="1">1</option></select>
+    </label>
+    <label>HOOI iterations <input id="iters" type="number" min="0" max="20" value="5"></label>
+    <label>JPEG quality: <span id="qv">0.85</span>
+      <input id="quality" type="range" min="0.3" max="1" step="0.05" value="0.85">
+    </label>
+    <button id="run" disabled>Loading Python…</button>
+  </section>
+
+  <p id="status"></p>
+  <div id="grid"></div>
+</main>
+
+<script>
+const PY = `
+import numpy as np
+
+def unfold(T, m):
+    return np.moveaxis(T, m, 0).reshape(T.shape[m], -1)
+
+def mode_dot(T, M, m):
+    Tm = np.moveaxis(T, m, 0)
+    sh = Tm.shape
+    out = (M @ Tm.reshape(sh[0], -1)).reshape(M.shape[0], *sh[1:])
+    return np.moveaxis(out, 0, m)
+
+def lead(A, r):
+    # wide matrix: eigh of the small Gram matrix; tall matrix: thin SVD
+    if A.shape[0] <= A.shape[1]:
+        _, V = np.linalg.eigh(A @ A.T)
+        return np.ascontiguousarray(V[:, ::-1][:, :r])
+    return np.linalg.svd(A, full_matrices=False)[0][:, :r]
+
+def tucker(X, ranks, n_iter):
+    ranks = [min(r, s) for r, s in zip(ranks, X.shape)]
+    U = [lead(unfold(X, n), r) for n, r in enumerate(ranks)]
+    for _ in range(n_iter):
+        for n in range(X.ndim):
+            Y = X
+            for m in range(X.ndim):
+                if m != n:
+                    Y = mode_dot(Y, U[m].T, m)
+            U[n] = lead(unfold(Y, n), ranks[n])
+    G = X
+    for n in range(X.ndim):
+        G = mode_dot(G, U[n].T, n)
+    return G, U
+
+def reconstruct(G, U):
+    Xr = G
+    for n, u in enumerate(U):
+        Xr = mode_dot(Xr, u, n)
+    return np.clip(Xr, 0, 1)
+
+def run(buf, h, w, r1, r2, r3, iters, out):
+    a = np.frombuffer(buf.to_py(), dtype=np.uint8).reshape(h, w, 4)
+    X = a[:, :, :3].astype(np.float32) / 255.0
+    G, U = tucker(X, [r1, r2, r3], iters)
+    Xr = reconstruct(G, U)
+    mse = float(np.mean((X - Xr) ** 2))
+    p = 10 * np.log10(1.0 / mse) if mse > 0 else 99.0
+    n_params = G.size + sum(u.size for u in U)
+    rgba = np.empty((h, w, 4), dtype=np.uint8)
+    rgba[:, :, :3] = np.round(Xr * 255)
+    rgba[:, :, 3] = 255
+    out.assign(rgba.reshape(-1))
+    return (float(p), float(X.size / n_params), [int(s) for s in G.shape])
+`;
+
+const $ = id => document.getElementById(id);
+const setStatus = t => { $('status').textContent = t; };
+const tick = () => new Promise(r => setTimeout(r, 30));
+let runFn = null, file = null, cards = [];
+
+function updateButton() {
+  $('run').disabled = !(runFn && file);
+  if (runFn) $('run').textContent = 'Compress';
+}
+
+(async () => {
+  try {
+    setStatus('Loading Pyodide + NumPy (first visit ~10 MB)…');
+    const py = await loadPyodide();
+    await py.loadPackage('numpy');
+    await py.runPythonAsync(PY);
+    runFn = py.globals.get('run');
+    setStatus('Ready. Choose an image.');
+    updateButton();
+  } catch (e) { setStatus('Failed to load Python: ' + e); }
+})();
+
+$('file').onchange = e => { file = e.target.files[0] || null; updateButton(); };
+
+$('quality').oninput = e => {
+  $('qv').textContent = (+e.target.value).toFixed(2);
+  cards.forEach(encode);
+};
+
+async function prepare() {
+  const bmp = await createImageBitmap(file);
+  const m = +$('maxside').value;
+  const s = Math.min(1, m / Math.max(bmp.width, bmp.height));
+  const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(bmp, 0, 0, w, h);
+  return { w, h, data: ctx.getImageData(0, 0, w, h).data, canvas: c };
+}
+
+function addCard(title, lines, canvas, tag) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.innerHTML = `<div class="meta"><b>${title}</b>${lines.join('<br>')}
+    <br><span class="size">…</span><br><a>Download JPEG</a></div>`;
+  el.prepend(canvas);
+  $('grid').append(el);
+  const card = { el, canvas, tag, url: null };
+  cards.push(card);
+  encode(card);
+}
+
+function encode(card) {
+  const q = +$('quality').value;
+  card.canvas.toBlob(blob => {
+    if (card.url) URL.revokeObjectURL(card.url);
+    card.url = URL.createObjectURL(blob);
+    const a = card.el.querySelector('a');
+    a.href = card.url;
+    a.download = `${file.name.replace(/\.[^.]+$/, '')}_${card.tag}_q${Math.round(q * 100)}.jpg`;
+    card.el.querySelector('.size').textContent = `JPEG size: ${(blob.size / 1024).toFixed(1)} KB`;
+  }, 'image/jpeg', q);
+}
+
+$('run').onclick = async () => {
+  const ranks = $('ranks').value.split(/[\s,;]+/).map(Number).filter(n => n > 0);
+  if (!ranks.length) { setStatus('Enter at least one rank.'); return; }
+  $('run').disabled = true;
+  cards.forEach(c => c.url && URL.revokeObjectURL(c.url));
+  cards = []; $('grid').innerHTML = '';
+  try {
+    const { w, h, data, canvas } = await prepare();
+    const input = new Uint8Array(data.buffer);
+    const crank = +$('crank').value, iters = +$('iters').value;
+    addCard('Original (resized)', [`${w} × ${h} px`, `Source file: ${(file.size / 1024).toFixed(1)} KB`], canvas, 'original');
+    for (const r of ranks) {
+      setStatus(`Computing rank ${r}…`);
+      await tick();
+      const t0 = performance.now();
+      const out = new Uint8Array(w * h * 4);
+      const res = runFn(input, h, w, r, r, crank, iters, out);
+      const [psnr, ratio, core] = res.toJs();
+      res.destroy();
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(out.buffer), w, h), 0, 0);
+      addCard(`Core ${core.join(' × ')}`,
+        [`Param ratio: ${ratio.toFixed(1)}×`, `PSNR: ${psnr.toFixed(2)} dB`,
+         `Time: ${((performance.now() - t0) / 1000).toFixed(1)} s`], c, `r${r}`);
+    }
+    setStatus('Done. Adjust JPEG quality to change file sizes.');
+  } catch (e) { setStatus('Error: ' + e); }
+  updateButton();
+};
+</script>
+</body>
+</html>
