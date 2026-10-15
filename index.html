@@ -132,7 +132,8 @@
   // username.github.io → repo is ALWAYS username.github.io
   // all path segments are just folders inside that repo
   if (hostname === `${owner}.github.io`) {
-    repo = `${owner}.github.io`;
+    // repo = `${owner}.github.io`;
+	  repo = 'project';
     folderPath = segments.join('/');
   } else {
     // org pages or custom domain
@@ -152,14 +153,14 @@
   try {
     // Get default branch
     // const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`);
-    const repoRes = await fetch(`https://api.github.com/repos/${owner}`);
+    const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`);
 
     if (!repoRes.ok) throw new Error(`Repo "${owner}/${repo}" not found or is private (HTTP ${repoRes.status})`);
     const repoData = await repoRes.json();
     const branch = repoData.default_branch;
 
     // Get full tree
-    const treeRes = await fetch(`https://api.github.com/repos/${owner}/git/trees/${branch}?recursive=1`);
+    const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`);
     if (!treeRes.ok) throw new Error(`Failed to fetch tree (HTTP ${treeRes.status})`);
     const treeData = await treeRes.json();
 
